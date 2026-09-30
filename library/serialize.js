@@ -1,4 +1,8 @@
-const { jidDecode } = require('@whiskeysockets/baileys');
+// Local jidDecode: no dependency on the Baileys module format (v7 is ESM-only).
+const jidDecode = (jid) => {
+    const m = /^(\d+)(?::(\d+))?@([a-z.]+)$/i.exec(String(jid || ''));
+    return m ? { user: m[1], device: m[2] ? Number(m[2]) : undefined, server: m[3] } : undefined;
+};
 
 const decodeJid = (jid) => {
     if (!jid) return jid;

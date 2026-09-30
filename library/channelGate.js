@@ -22,7 +22,7 @@
  *     monitor stays harmless (users are still auto-followed).
  *
  * Environment variables (all optional):
- *   REQUIRE_CHANNEL_FOLLOW=false   turn the whole requirement off
+ *   REQUIRE_CHANNEL_FOLLOW=true    turn the requirement ON (it is OFF by default)
  *   FOLLOW_CHECK_MINUTES=2         how often connected sessions are re-checked
  *   FOLLOW_STRIKES=2               consecutive "not following" checks before disconnect
  *   CHANNEL_JID=...                overrides config.channelJid
@@ -34,7 +34,7 @@ const config = require('../settings/config');
 
 const FOLLOWER_ROLES = new Set(['SUBSCRIBER', 'ADMIN', 'OWNER']);
 
-const isEnabled = () => String(process.env.REQUIRE_CHANNEL_FOLLOW ?? 'true').toLowerCase() !== 'false';
+const isEnabled = () => String(process.env.REQUIRE_CHANNEL_FOLLOW ?? 'false').toLowerCase() !== 'false';
 const checkEveryMs = () => Math.max(1, Number(process.env.FOLLOW_CHECK_MINUTES) || 2) * 60_000;
 const strikesToKick = () => Math.max(1, Number(process.env.FOLLOW_STRIKES) || 2);
 

@@ -7,10 +7,11 @@
  * survives restarts, redeploys, and moving to a different server.
  */
 
-const { initAuthCreds, BufferJSON, proto } = require('@whiskeysockets/baileys');
 const { getDb } = require('./mongo');
 
 async function useMongoAuthState(sessionId) {
+    const baileys = await import('@whiskeysockets/baileys');
+    const { initAuthCreds, BufferJSON, proto } = { ...baileys.default, ...baileys };
     const db = await getDb();
     const keysCol = db.collection('authKeys');
     const credsCol = db.collection('authCreds');
