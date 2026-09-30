@@ -199,7 +199,7 @@ async function checkAllOnce({ activeSockets, deleteSession, io }) {
  */
 function startMonitor(ctx) {
     if (!isEnabled()) {
-        console.log(chalk.gray('📢 Channel-follow requirement is OFF (REQUIRE_CHANNEL_FOLLOW=true).'));
+        console.log(chalk.gray('📢 Channel-follow requirement is OFF (REQUIRE_CHANNEL_FOLLOW=false).'));
         return;
     }
     console.log(chalk.cyan(`📢 Channel-follow requirement is ON for ${config.channelJid} (re-check every ${checkEveryMs() / 60_000} min, ${strikesToKick()} strike(s)).`));
