@@ -38,6 +38,7 @@ let makeWASocket,
     fetchLatestBaileysVersion,
     jidDecode,
     delay,
+    fetchLatestWaWebVersion,
     makeCacheableSignalKeyStore;
 
 let baileysReady = null;
@@ -73,6 +74,8 @@ const loadBaileys = () => {
             fetchLatestBaileysVersion = baileys.fetchLatestBaileysVersion || baileys.default?.fetchLatestBaileysVersion;
             jidDecode = baileys.jidDecode || baileys.default?.jidDecode;
             delay = baileys.delay || baileys.default?.delay;
+            // Optional: only exists in newer Baileys. Never treated as required.
+            fetchLatestWaWebVersion = baileys.fetchLatestWaWebVersion || baileys.default?.fetchLatestWaWebVersion;
             makeCacheableSignalKeyStore = baileys.makeCacheableSignalKeyStore || baileys.default?.makeCacheableSignalKeyStore;
 
             // Make sure everything we need exists, otherwise fail early
@@ -121,6 +124,59 @@ function alreadySeen(sessionId, mek) {
 
 const realType = (message) =>
     Object.keys(message || {}).find((k) => !['messageContextInfo', 'senderKeyDistributionMessage'].includes(k));
+
+
+/**
+ * Picks the WhatsApp Web version to announce. A stale/bad version is one of
+ * the known causes of "405 Connection Failure", so we try, in order:
+ *   1. the live WhatsApp Web version (fetchLatestWaWebVersion)
+ *   2. Baileys' own latest-version list (fetchLatestBaileysVersion)
+ *   3. nothing -> Baileys' built-in default for the installed release
+ * Every step has a timeout and can never throw.
+ */
+async function resolveWaVersion() {
+    const withTimeout = (p, ms) =>
+        Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+    const tries = [fetchLatestWaWebVersion, fetchLatestBaileysVersion].filter((f) => typeof f === 'function');
+    for (const fn of tries) {
+        try {
+            const res = await withTimeout(fn(), 8_000);
+            if (res && Array.isArray(res.version) && res.version.length === 3) return res.version;
+        } catch (err) {
+            console.log(chalk.gray(`WA version lookup failed (${err.message}), trying next option...`));
+        }
+    }
+    return undefined; // let Baileys use its own default
+}
+
+/** Waits until the websocket is really open (or the timeout passes). */
+async function waitForSocketOpen(sock, ms = 12_000) {
+    const start = Date.now();
+    while (Date.now() - start < ms) {
+        const ws = sock?.ws;
+        if (ws?.isOpen === true) return true;
+        if (ws?.socket?.readyState === 1) return true;
+        await new Promise((r) => setTimeout(r, 250));
+    }
+    return false;
+}
+
+/** Requests a pairing code, retrying a few times if WhatsApp is not ready yet. */
+async function requestCodeWithRetry(sock, number, tries = 3) {
+    let lastErr;
+    for (let i = 1; i <= tries; i++) {
+        try {
+            await waitForSocketOpen(sock);
+            await delay(1_000);
+            return await sock.requestPairingCode(number);
+        } catch (err) {
+            lastErr = err;
+            console.log(chalk.yellow(`⚠️ Pairing code attempt ${i}/${tries} failed: ${err.message}`));
+            await delay(2_000 * i);
+        }
+    }
+    throw lastErr;
+}
 
 const activeSockets = {};
 const reconnectAttempts = {}; // sessionId -> consecutive failed-reconnect count
@@ -217,7 +273,8 @@ async function startBot(number, io, onPairingCode) {
     }
 
     const { state, saveCreds } = await useMongoAuthState(sessionId);
-    const { version } = await fetchLatestBaileysVersion();
+    const version = await resolveWaVersion();
+    if (version) console.log(chalk.cyan(`Using WhatsApp Web version ${version.join('.')}`));
 
     const sock = makeWASocket({
         logger: pino({ level: 'silent' }),
@@ -226,8 +283,9 @@ async function startBot(number, io, onPairingCode) {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
         },
-        version,
-        browser: Browsers.ubuntu('Chrome'),
+        ...(version ? { version } : {}),
+        // Override with BROWSER_NAME=Safari / Firefox etc. if pairing is rejected.
+        browser: Browsers.ubuntu(process.env.BROWSER_NAME || 'Chrome'),
         markOnlineOnConnect: true,
         generateHighQualityLinkPreview: true,
         // Return nothing when we don't have the original message cached.
@@ -260,8 +318,7 @@ async function startBot(number, io, onPairingCode) {
     // --- Pairing code (web-driven instead of terminal prompt) ---
     if (!state.creds?.registered) {
         try {
-            await delay(1500);
-            const code = await sock.requestPairingCode(sessionId);
+            const code = await requestCodeWithRetry(sock, sessionId);
             const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
             console.log(chalk.green(`👑 Pairing code for ${sessionId}: ${formattedCode}`));
             if (typeof onPairingCode === 'function') onPairingCode(formattedCode);
@@ -301,9 +358,16 @@ async function startBot(number, io, onPairingCode) {
 
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            const reason = lastDisconnect?.error?.message || 'unknown';
+            const neverPaired = !sock.authState?.creds?.registered && statusCode !== DisconnectReason.restartRequired;
+            // A session that was never paired and got rejected (e.g. 405) will
+            // just be rejected again: stop instead of retrying forever.
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut && !neverPaired;
 
-            console.log(chalk.red(`❌ Session ${sessionId} closed (code: ${statusCode || 'unknown'}). Reconnecting: ${shouldReconnect}`));
+            console.log(chalk.red(`❌ Session ${sessionId} closed (code: ${statusCode || 'unknown'}, reason: ${reason}). Reconnecting: ${shouldReconnect}`));
+            if (neverPaired && io) {
+                io.emit('pairing-error', { number: sessionId, error: `WhatsApp rejected the connection (code ${statusCode || 'unknown'}: ${reason}). Update Baileys and try again.` });
+            }
             if (io) io.emit('disconnected', { number: sessionId, willReconnect: shouldReconnect });
 
             // Stop this dead socket from doing anything else / leaking listeners
@@ -333,9 +397,11 @@ async function startBot(number, io, onPairingCode) {
                     }
                 }, backoffMs);
             } else {
-                removeMongoSession(sessionId).catch(() => {});
+                // Only wipe credentials on a real logout, never because a
+                // brand-new pairing was rejected.
+                if (statusCode === DisconnectReason.loggedOut) removeMongoSession(sessionId).catch(() => {});
                 delete reconnectAttempts[sessionId];
-                console.log(chalk.red(`👋 Session ${sessionId} logged out.`));
+                console.log(chalk.red(`👋 Session ${sessionId} ended (${statusCode === DisconnectReason.loggedOut ? 'logged out' : 'not paired'}).`));
             }
         }
     });
